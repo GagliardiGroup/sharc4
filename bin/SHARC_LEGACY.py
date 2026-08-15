@@ -42,7 +42,7 @@ import numpy as np
 from constants import IToMult
 from SHARC_INTERFACE import SHARC_INTERFACE
 from qmout import QMout
-from utils import mkdir, question, writefile, cleandir, InDir
+from utils import mkdir, question, writefile, readfile, cleandir, InDir
 from logger import log
 
 
@@ -126,6 +126,7 @@ Interfaces = {
         'get_routine': 'get_PYSCF',
         'prepare_routine': 'prepare_PYSCF',
         'features': {'h': [],
+                     'soc': [],
                      'dm': [],
                      'grad': [],
                      'nacdr': [],
@@ -1303,6 +1304,7 @@ class SHARC_LEGACY(SHARC_INTERFACE):
         )
 
         self.legacy_interface = None
+        self.savedict = {}
 
 
 
@@ -1414,6 +1416,8 @@ class SHARC_LEGACY(SHARC_INTERFACE):
 
     def write_step_file(self):
         super().write_step_file()
+        if self.persistent:
+            self.savedict["last_step"] = self.QMin.save["step"]
         
     # def update_step(self, step: int = None):
     #     super().update_step(step)
@@ -1449,6 +1453,12 @@ class SHARC_LEGACY(SHARC_INTERFACE):
         # setup scratch dir to run 
         if not os.path.isdir(self.QMin.resources["scratchdir"]):
             mkdir(self.QMin.resources["scratchdir"])
+        if self.persistent:
+            stepfile = os.path.join(self.QMin.save["savedir"], "STEP")
+            last_step = None
+            if os.path.isfile(stepfile):
+                last_step = int(readfile(stepfile)[0])
+            self.savedict["last_step"] = last_step
         return
 
 
