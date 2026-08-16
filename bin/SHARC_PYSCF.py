@@ -540,12 +540,17 @@ at least one task"""
     qmin["nstates"] = nstates
     qmin["nmstates"] = nmstates
 
-    for i, n in enumerate(qmin["states"]):
-        mult = i + 1
-        if n > 0 and mult not in (1, 3):
-            raise NotImplementedError(
-                f"Multiplicity {mult} not supported. Only singlets (1) and triplets (3) are implemented."
-            )
+    unsupported_multiplicities = [
+        mult
+        for mult, nroots in enumerate(qmin["states"], 1)
+        if nroots > 0 and mult not in (1, 3)
+    ]
+    if unsupported_multiplicities:
+        raise NotImplementedError(
+            "The SHARC-PySCF interface supports only singlets, triplets, or mixed "
+            "singlet-triplet calculations currently; requested unsupported "
+            f"multiplicities: {unsupported_multiplicities}."
+        )
 
     possible_tasks = [
         "h",
@@ -777,8 +782,8 @@ at least one task"""
 
     template_dict = {}
     INTEGERS_KEYS = ["ncas", "nelecas", "roots", "grids-level", "verbose", "max-cycle-macro", "max-cycle-micro", "ah-max-cycle", "ah-start-cycle", "grad-max-cycle", "charge"]
-    STRING_KEYS = ["basis", "method", "pdft-functional", "soc-hamiltonian", "df-auxbasis"]
-    FLOAT_KEYS = ["conv-tol", "conv-tol-grad", "max-stepsize", "ah-start-tol", "ah-level-shift", "ah-conv-tol", "ah-lindep", "fix-spin-shift", "grad-conv-atol", "grad-level-shift"]
+    STRING_KEYS = ["basis", "method", "pdft-functional", "soc-hamiltonian", "df-auxbasis", "dipole-origin"]
+    FLOAT_KEYS = ["conv-tol", "conv-tol-grad", "max-stepsize", "ah-start-tol", "ah-level-shift", "ah-conv-tol", "ah-lindep", "fix-spin-shift"]
     BOOL_KEYS = ["density-fit"]
 
     template_dict["roots"] = [0 for _ in range(8)]
@@ -795,6 +800,7 @@ at least one task"""
     template_dict["soc-hamiltonian"] = "DKH"
     template_dict["density-fit"] = False
     template_dict["df-auxbasis"] = None
+    template_dict["dipole-origin"] = "coord-center"
 
     # CASSCF solver defaults
     template_dict["conv-tol"] = 1e-7
@@ -814,7 +820,6 @@ at least one task"""
 
     # gradient solver defaults
     template_dict["grad-max-cycle"] = 50
-    template_dict["grad-level-shift"] = 1e-8
 
     for line in template:
         orig = re.sub("#.*$", "", line).split(None, 1)
@@ -899,19 +904,47 @@ at least one task"""
             print("NACdr not allowed with L-PDFT!")
             sys.exit(1)
 
+    active_multiplicities = [
+        mult for mult, roots in enumerate(qmin["states"], 1) if roots > 0
+    ]
+    if active_multiplicities:
+        parity = active_multiplicities[0] % 2
+        if any(mult % 2 != parity for mult in active_multiplicities):
+            print("All requested multiplicities must have the same electron-number parity.")
+            sys.exit(1)
+        nelecas = template_dict["nelecas"]
+        for mult in active_multiplicities:
+            spin = mult - 1
+            if nelecas < spin or (nelecas - spin) % 2:
+                print(
+                    f"Active space with {nelecas} electrons is incompatible "
+                    f"with multiplicity {mult}."
+                )
+                sys.exit(1)
+
+    if qmin["method"] == 3 and len(active_multiplicities) > 1:
+        print("CMS-PDFT is not compatible with the state-average-mix spin solver.")
+        sys.exit(1)
+
     ALLOWED_SOC_HAMILTONIANS = ["DKH", "BP"]
     template_dict["soc-hamiltonian"] = template_dict["soc-hamiltonian"].upper()
     if template_dict["soc-hamiltonian"] not in ALLOWED_SOC_HAMILTONIANS:
         print(f"Unknown SOC Hamiltonian '{template_dict['soc-hamiltonian']}'. Allowed: {ALLOWED_SOC_HAMILTONIANS}")
         sys.exit(1)
 
+    allowed_dipole_origins = ["coord-center", "mass-center", "charge-center"]
+    template_dict["dipole-origin"] = template_dict["dipole-origin"].lower().replace(
+        "_", "-"
+    )
+    if template_dict["dipole-origin"] not in allowed_dipole_origins:
+        print(
+            f"Unknown dipole origin '{template_dict['dipole-origin']}'. "
+            f"Allowed: {allowed_dipole_origins}"
+        )
+        sys.exit(1)
+
     if "soc" in qmin:
-        has_singlets = len(qmin["states"]) > 0 and qmin["states"][0] > 0
-        has_triplets = len(qmin["states"]) > 2 and qmin["states"][2] > 0
-        if has_singlets and not has_triplets:
-            print("SOC is not available for singlet-only calculations; include triplet states or remove SOC.")
-            sys.exit(1)
-        if not has_triplets:
+        if 3 not in active_multiplicities:
             print("SOC requires at least one triplet state.")
             sys.exit(1)
         if qmin["method"] != 1:
@@ -1112,8 +1145,8 @@ def build_mol(qmin):
     log_file = f"PySCF_{os.path.basename(qmin['scratchdir'])}.log"
     previous_chk = os.path.join(qmin["scratchdir"], "pyscf.old.chk")
     verbose = qmin["template"]["verbose"]
-    states = qmin.get("states", [])
-    triplet_only = len(states) > 2 and states[2] > 0 and states[0] == 0
+    active_multiplicities = _get_active_multiplicities(qmin)
+    reference_spin = active_multiplicities[0][0] - 1
 
     if os.path.isfile(previous_chk) and "samestep" in qmin:
         if DEBUG:
@@ -1133,7 +1166,7 @@ def build_mol(qmin):
             verbose=verbose,
             symmetry=False,
             charge=qmin["template"]["charge"],
-            spin=2 if triplet_only else 0,
+            spin=reference_spin,
             max_memory=qmin["memory"],
         )
         mol.build()
@@ -1141,16 +1174,39 @@ def build_mol(qmin):
     return mol
 
 
-def _get_spin_state_counts(qmin):
-    states = qmin["states"]
-    ns = states[0] if len(states) > 0 else 0
-    nt = states[2] if len(states) > 2 else 0
-    return ns, nt
+def _get_active_multiplicities(qmin):
+    """returns ``(multiplicity, number of roots)`` for requested spin spaces."""
+    return [
+        (mult, nroots)
+        for mult, nroots in enumerate(qmin["states"], 1)
+        if nroots > 0
+    ]
 
 
 def _is_multispin(qmin):
-    ns, nt = _get_spin_state_counts(qmin)
-    return ns > 0 and nt > 0
+    return len(_get_active_multiplicities(qmin)) > 1
+
+
+def _get_solver_multiplicities(qmin):
+    """returns spin spaces in the order used by the PySCF solver."""
+    if _is_multispin(qmin):
+        return [
+            (mult, qmin["template"]["roots"][mult - 1])
+            for mult, _ in _get_active_multiplicities(qmin)
+        ]
+    mult = _get_active_multiplicities(qmin)[0][0]
+    return [(mult, qmin["template"]["roots"][mult - 1])]
+
+
+def _nelecas_for_multiplicity(nelecas, mult):
+    """returns alpha/beta active electron counts for a spin multiplicity."""
+    nelec = sum(nelecas) if isinstance(nelecas, (tuple, list)) else nelecas
+    spin = mult - 1
+    if nelec < spin or (nelec - spin) % 2:
+        raise ValueError(
+            f"Active space with {nelec} electrons is incompatible with multiplicity {mult}"
+        )
+    return ((nelec + spin) // 2, (nelec - spin) // 2)
 
 
 def gen_solver(mol, qmin):
@@ -1159,8 +1215,8 @@ def gen_solver(mol, qmin):
     if df_auxbasis in (None, "", "none"):
         df_auxbasis = None
 
-    ns, nt = _get_spin_state_counts(qmin)
-    mf = scf.ROHF(mol) if nt > 0 and ns == 0 else scf.RHF(mol)
+    active_multiplicities = _get_active_multiplicities(qmin)
+    mf = scf.RHF(mol) if mol.spin == 0 else scf.ROHF(mol)
     if use_density_fit:
         print(f"Using density fitting; auxbasis={df_auxbasis}", flush=True)
         mf = mf.density_fit(auxbasis=df_auxbasis)
@@ -1170,11 +1226,8 @@ def gen_solver(mol, qmin):
     ncas = qmin["template"]["ncas"]
     nelecas = qmin["template"]["nelecas"]
     multispin = _is_multispin(qmin)
-    if nt > 0 and ns == 0 and isinstance(nelecas, int):
-        if nelecas < 2:
-            raise ValueError("Triplet active space needs at least two active electrons")
-        nelecas = (nelecas // 2 + 1, nelecas // 2 - 1)
-        print(f"Using triplet active electron split nelecas={nelecas}", flush=True)
+    if not multispin:
+        nelecas = _nelecas_for_multiplicity(nelecas, active_multiplicities[0][0])
 
     if qmin["method"] == 0:
         solver = mcscf.CASSCF(mf, ncas, nelecas)
@@ -1192,64 +1245,41 @@ def gen_solver(mol, qmin):
         solver = mcscf.density_fit(solver, auxbasis=df_auxbasis)
 
     if multispin:
-        # mixed singlet+triplet
         try:
             from pyscf.csf_fci import csf_solver
         except ImportError as e:
             print("pyscf-forge with CSF solver required for mix-spin calculations")
             raise e
 
-        ns_roots = qmin["template"]["roots"][0]
-        nt_roots = qmin["template"]["roots"][2] if len(qmin["template"]["roots"]) > 2 else 0
-        total_roots = ns_roots + nt_roots
+        spin_spaces = _get_solver_multiplicities(qmin)
+        total_roots = sum(nroots for _, nroots in spin_spaces)
         weights = [1.0 / total_roots] * total_roots
 
         solvers = []
-        if ns_roots > 0:
-            s_solver = csf_solver(mol, smult=1)
-            s_solver.nroots = ns_roots
-            s_solver.spin = 0
-            solvers.append(s_solver)
-        if nt_roots > 0:
-            t_solver = csf_solver(mol, smult=3)
-            t_solver.nroots = nt_roots
-            t_solver.spin = 2  # Ms=1 (alphae=nelec//2+1, betae=nelec//2-1) required by SISO
-            solvers.append(t_solver)
+        for mult, nroots in spin_spaces:
+            spin_solver = csf_solver(mol, smult=mult)
+            spin_solver.nroots = nroots
+            spin_solver.spin = mult - 1
+            solvers.append(spin_solver)
 
         if qmin["method"] == 1:
             solver = solver.multi_state_mix(solvers, weights, "lin")
         else:
             solver = mcscf.state_average_mix_(solver, solvers, weights)
 
-    elif nt > 0:
-        # triplets only
-        nroots = qmin["template"]["roots"][2]
-        weights = [1.0 / nroots] * nroots
-
-        from pyscf import fci
-        t_solver = fci.direct_spin1.FCI(mol)
-        t_solver.nroots = nroots
-        t_solver.spin = 2
-        t_solver = fci.addons.fix_spin(t_solver, ss=2, shift=qmin["template"]["fix-spin-shift"])
-        solver.fcisolver = t_solver
-
-        if qmin["method"] == 1:
-            solver = solver.multi_state(weights, method="lin")
-        elif qmin["method"] == 3:
-            solver = solver.multi_state(weights, method="cms")
-        elif qmin["method"] in (2, 0):
-            solver = solver.state_average(weights)
-
     else:
-        # singlets only
-        nroots = qmin["template"]["roots"][0]
+        mult = active_multiplicities[0][0]
+        nroots = qmin["template"]["roots"][mult - 1]
         weights = [1.0 / nroots] * nroots
 
         try:
             from pyscf.csf_fci import csf_solver
-            solver.fcisolver = csf_solver(mol, smult=1)
+            solver.fcisolver = csf_solver(mol, smult=mult)
         except ImportError:
-            solver.fix_spin_(ss=0, shift=qmin["template"]["fix-spin-shift"])
+            spin = (mult - 1) / 2
+            solver.fix_spin_(
+                ss=spin * (spin + 1), shift=qmin["template"]["fix-spin-shift"]
+            )
 
         if qmin["method"] == 1:
             solver = solver.multi_state(weights, method="lin")
@@ -1317,13 +1347,28 @@ def gen_solver(mol, qmin):
 def _lpdft_state_idx(mult, state_1indexed, qmin):
     """Converts SHARC state labeling to PySCF's labeling
     (mult, state) to PDFT state index (0 index)"""
-    ns, _ = _get_spin_state_counts(qmin)
-    if mult == 1:
-        return state_1indexed - 1
-    elif mult == 3:
-        return ns + (state_1indexed - 1)
-    else:
-        raise ValueError(f"Unsupported multiplicity {mult}")
+    offset = 0
+    for solver_mult, nroots in _get_solver_multiplicities(qmin):
+        if solver_mult == mult:
+            return offset + state_1indexed - 1
+        offset += nroots
+    raise ValueError(f"Multiplicity {mult} is not present in the PySCF solver")
+
+
+def _get_dipole_origin(mol, origin):
+    normalized = origin.upper().replace("-", "_")
+    coords = mol.atom_coords()
+    if normalized == "COORD_CENTER":
+        return np.zeros(3)
+    if normalized == "MASS_CENTER":
+        masses = mol.atom_mass_list()
+        return masses.dot(coords) / masses.sum()
+    if normalized == "CHARGE_CENTER":
+        charges = mol.atom_charges()
+        return charges.dot(coords) / charges.sum()
+    raise ValueError(
+        f"Unknown dipole origin '{origin}'; use coord-center, mass-center, or charge-center"
+    )
 
 
 def get_dipole_elements(solver, qmin):
@@ -1332,12 +1377,11 @@ def get_dipole_elements(solver, qmin):
     mo_cas = solver.mo_coeff[:, solver.ncore : solver.ncore + solver.ncas]
     ncas = solver.ncas
     nelecas = solver.nelecas
-    nelecas_tot = sum(nelecas) if isinstance(nelecas, (tuple, list)) else nelecas
-
-    ns, nt = _get_spin_state_counts(qmin)
     nmstates = qmin["nmstates"]
 
-    gauge_center = (0, 0, 0)
+    gauge_center = _get_dipole_origin(
+        mol, qmin["template"].get("dipole-origin", "coord-center")
+    )
 
     dm_core = 2 * mo_core @ mo_core.conj().T
 
@@ -1363,96 +1407,58 @@ def get_dipole_elements(solver, qmin):
     def _trans_rdm1(ci_bra, ci_ket, fci_solver, nelec):
         return _base_fci_call(fci_solver, "trans_rdm1", ci_bra, ci_ket, ncas, nelec)
 
-    # Dealing with multiple spins
+    spin_spaces = _get_solver_multiplicities(qmin)
     if _is_multispin(qmin):
-        try:
-            fci_s, fci_t = solver.fcisolver.fcisolvers
-        except AttributeError:
-            fci_s = fci_t = solver.fcisolver
-
-        nelec_s = (nelecas_tot // 2, nelecas_tot // 2)
-        nelec_t = (nelecas_tot // 2 + 1, nelecas_tot // 2 - 1)
-
-        # singlet-singlet
-        for I in range(ns):
-            casdm1 = _state_rdm1(solver.ci[I], fci_s, nelec_s)
-            dm1 = dm_core + mo_cas @ casdm1 @ mo_cas.conj().T
-            dip_matrix[:, I, I] = nucl_term - np.einsum("xij,ji->x", dipole_ints, dm1)
-
-        for bra in range(ns):
-            for ket in range(bra + 1, ns):
-                t_dm = _trans_rdm1(solver.ci[bra], solver.ci[ket], fci_s, nelec_s)
-                t_dm = mo_cas @ t_dm @ mo_cas.conj().T
-                t_dip = -np.einsum("xij,ji->x", dipole_ints, t_dm)
-                dip_matrix[:, bra, ket] = t_dip
-                dip_matrix[:, ket, bra] = t_dip
-
-        #triplet diagonal
-        for I in range(nt):
-            ci_I = solver.ci[ns + I]
-            casdm1 = _state_rdm1(ci_I, fci_t, nelec_t)
-            dm1 = dm_core + mo_cas @ casdm1 @ mo_cas.conj().T
-            diag_dip = nucl_term - np.einsum("xij,ji->x", dipole_ints, dm1)
-            for ms_idx in range(3):
-                sharc_I = ns + ms_idx * nt + I
-                dip_matrix[:, sharc_I, sharc_I] = diag_dip
-
-        #triplet off diagonal
-        for bra in range(nt):
-            for ket in range(bra + 1, nt):
-                t_dm = _trans_rdm1(solver.ci[ns + bra], solver.ci[ns + ket], fci_t, nelec_t)
-                t_dm = mo_cas @ t_dm @ mo_cas.conj().T
-                t_dip = -np.einsum("xij,ji->x", dipole_ints, t_dm)
-                for ms_idx in range(3):
-                    sharc_bra = ns + ms_idx * nt + bra
-                    sharc_ket = ns + ms_idx * nt + ket
-                    dip_matrix[:, sharc_bra, sharc_ket] = t_dip
-                    dip_matrix[:, sharc_ket, sharc_bra] = t_dip
-
-    elif nt > 0:
-        # triplets only
-        fci_t = solver.fcisolver
-        nelec_t = (nelecas_tot // 2 + 1, nelecas_tot // 2 - 1)
-
-        for I in range(nt):
-            casdm1 = _state_rdm1(solver.ci[I], fci_t, nelec_t)
-            dm1 = dm_core + mo_cas @ casdm1 @ mo_cas.conj().T
-            diag_dip = nucl_term - np.einsum("xij,ji->x", dipole_ints, dm1)
-            for ms_idx in range(3):
-                sharc_I = ms_idx * nt + I
-                dip_matrix[:, sharc_I, sharc_I] = diag_dip
-
-        for bra in range(nt):
-            for ket in range(bra + 1, nt):
-                t_dm = _trans_rdm1(solver.ci[bra], solver.ci[ket], fci_t, nelec_t)
-                t_dm = mo_cas @ t_dm @ mo_cas.conj().T
-                t_dip = -np.einsum("xij,ji->x", dipole_ints, t_dm)
-                for ms_idx in range(3):
-                    sharc_bra = ms_idx * nt + bra
-                    sharc_ket = ms_idx * nt + ket
-                    dip_matrix[:, sharc_bra, sharc_ket] = t_dip
-                    dip_matrix[:, sharc_ket, sharc_bra] = t_dip
-
+        fci_solvers = solver.fcisolver.fcisolvers
     else:
-        # singlets only
-        nroots = ns
+        fci_solvers = [solver.fcisolver]
+
+    sharc_indices = {
+        tuple(state): index - 1 for index, state in qmin["statemap"].items()
+    }
+    ci_offset = 0
+    requested_roots = dict(_get_active_multiplicities(qmin))
+    for (mult, solver_nroots), fci_solver in zip(spin_spaces, fci_solvers):
+        nroots = requested_roots.get(mult, 0)
+        nelec = _nelecas_for_multiplicity(nelecas, mult)
+        spatial_dipoles = np.zeros((3, nroots, nroots))
+
         for state in range(nroots):
-            casdm1 = solver.fcisolver._base_class.make_rdm1(
-                solver.fcisolver, solver.ci[state], ncas, nelecas
-            )
+            casdm1 = _state_rdm1(solver.ci[ci_offset + state], fci_solver, nelec)
             dm1 = dm_core + mo_cas @ casdm1 @ mo_cas.conj().T
-            dip_matrix[:, state, state] = nucl_term - np.einsum("xij,ji->x", dipole_ints, dm1)
+            spatial_dipoles[:, state, state] = nucl_term - np.einsum(
+                "xij,ji->x", dipole_ints, dm1
+            )
 
         for bra in range(nroots):
             for ket in range(bra + 1, nroots):
-                t_dm = solver.fcisolver.trans_rdm1(
-                    solver.ci[bra], solver.ci[ket], ncas, nelecas
+                t_dm = _trans_rdm1(
+                    solver.ci[ci_offset + bra],
+                    solver.ci[ci_offset + ket],
+                    fci_solver,
+                    nelec,
                 )
                 t_dm = mo_cas @ t_dm @ mo_cas.conj().T
                 t_dip = -np.einsum("xij,ji->x", dipole_ints, t_dm)
-                dip_matrix[:, bra, ket] = t_dip
-                dip_matrix[:, ket, bra] = t_dip
-    #dip_matrix now should have shape (3, nmstates, nmstates)
+                spatial_dipoles[:, bra, ket] = t_dip
+                spatial_dipoles[:, ket, bra] = t_dip
+
+        # The dipole is evaluated in the spin-orbit-free (MCH) basis.  It is
+        # spin independent, so only states with equal multiplicity and Ms can
+        # couple; all other matrix elements remain zero.
+        ms_values = sorted(
+            {ms for state_mult, _, ms in sharc_indices if state_mult == mult}
+        )
+        for ms in ms_values:
+            for bra in range(nroots):
+                for ket in range(nroots):
+                    sharc_bra = sharc_indices[(mult, bra + 1, ms)]
+                    sharc_ket = sharc_indices[(mult, ket + 1, ms)]
+                    dip_matrix[:, sharc_bra, sharc_ket] = spatial_dipoles[
+                        :, bra, ket
+                    ]
+        ci_offset += solver_nroots
+
     return dip_matrix
 
 
@@ -1463,15 +1469,11 @@ def get_soc_hamiltonian(solver, qmin):
     """
     from pyscf.siso import SISO
 
-    ns, nt = _get_spin_state_counts(qmin)
     nmstates = qmin["nmstates"]
     soc_ham_type = qmin["template"].get("soc-hamiltonian", "DKH")
 
-    modelspace = []
-    if ns > 0:
-        modelspace.append((ns, 1))
-    if nt > 0:
-        modelspace.append((nt, 3))
+    spin_spaces = _get_active_multiplicities(qmin)
+    modelspace = [(nroots, mult) for mult, nroots in spin_spaces]
 
     ci_orig = list(solver.ci) if isinstance(solver.ci, list) else solver.ci
     e_states_orig = list(solver.e_states)
@@ -1484,14 +1486,30 @@ def get_soc_hamiltonian(solver, qmin):
         solver.ci = ci_orig
         solver.e_states = e_states_orig
 
-    if h_siso.shape != (nmstates, nmstates):
-        raise RuntimeError(f"SOC Hamiltonian has shape {h_siso.shape}, "f"expected {(nmstates, nmstates)}")
+    expected_siso_size = sum(mult * nroots for mult, nroots in spin_spaces)
+    if h_siso.shape != (expected_siso_size, expected_siso_size):
+        raise RuntimeError(
+            f"SOC Hamiltonian has shape {h_siso.shape}, "
+            f"expected {(expected_siso_size, expected_siso_size)}"
+        )
 
-    #pyscf has state ordering (T1 ms=-1,0,+1  T2 ...) vs SHARC ms ordering
-    #(all ms=-1 roots, then all ms=0 roots, then all ms=+1 roots)
-    perm = list(range(ns)) + [ns + 3 * state_idx + ms_idx for ms_idx in range(3) for state_idx in range(nt)]
+    # PySCF groups Ms components by spatial root; SHARC groups roots by Ms.
+    # The SISO model space contains the roots requested in QM.in.
+    requested_roots = dict(_get_active_multiplicities(qmin))
+    perm = []
+    offset = 0
+    for mult, solver_nroots in spin_spaces:
+        for ms_idx in range(mult):
+            for state_idx in range(requested_roots.get(mult, 0)):
+                perm.append(offset + mult * state_idx + ms_idx)
+        offset += mult * solver_nroots
 
     h_sharc = h_siso[np.ix_(perm, perm)]
+    if h_sharc.shape != (nmstates, nmstates):
+        raise RuntimeError(
+            f"Reordered SOC Hamiltonian has shape {h_sharc.shape}, "
+            f"expected {(nmstates, nmstates)}"
+        )
 
     if not np.allclose(h_sharc, h_sharc.conj().T, atol=1e-8):
         max_dev = np.max(np.abs(h_sharc - h_sharc.conj().T))
@@ -1511,8 +1529,6 @@ def get_grad(solver, qmin):
 
     solver_grad = solver.nuc_grad_method()
     solver_grad.max_cycle = qmin["template"]["grad-max-cycle"]
-    solver_grad.conv_atol = qmin["template"].get("grad-conv-atol", 1e-2)
-    solver_grad.level_shift = qmin["template"].get("grad-level-shift", 1e-8)
 
     for i in sorted(qmin["statemap"]):
         mult, state, _ = tuple(qmin["statemap"][i])
@@ -1564,19 +1580,16 @@ def get_nac(solver, qmin):
 
 
 def _build_energy_vector(solver, qmin):
-    """PDFT solver.e_states contains one energy per spatial state. SHARC needs one energy per ms
-    """
-    ns, nt = _get_spin_state_counts(qmin)
-    e_spatial = list(solver.e_states)  # length ns + nt
-
+    """Expand PySCF spatial-state energies over SHARC Ms components."""
+    e_spatial = list(solver.e_states)
+    requested_roots = dict(_get_active_multiplicities(qmin))
     energies = []
-    # Singlets (ms=0 only)
-    for i in range(ns):
-        energies.append(e_spatial[i])
-    # Triplets: three ms substates per spatial state, grouped by ms
-    for ms_idx in range(3):
-        for j in range(nt):
-            energies.append(e_spatial[ns + j])
+    offset = 0
+    for mult, solver_nroots in _get_solver_multiplicities(qmin):
+        nroots = requested_roots.get(mult, 0)
+        for _ in range(mult):
+            energies.extend(e_spatial[offset : offset + nroots])
+        offset += solver_nroots
 
     return np.array(energies)
 
